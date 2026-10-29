@@ -1,0 +1,454 @@
+"use strict";
+
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const http = require("node:http");
+const net = require("node:net");
+const dgram = require("node:dgram");
+const { randomInt } = require("node:crypto");
+const os = require("node:os");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
+const { test } = require("node:test");
+const { bundledRefresh } = require("../fixtures/bundled-refresh");
+const { verifyDisconnect } = require("../fixtures/core-disconnect");
+const { waitForInitialConfig } = require("../fixtures/core-startup-readiness");
+const { createClashApi } = require("../../main/dist/electron/core/network/clash-api");
+const { isMixedPortAvailable } = require("../../main/dist/electron/core/network/mixed-port-availability");
+const { setManualMixedPort } = require("../../main/dist/electron/core/network/manual-mixed-port");
+const { buildStore } = require("../fixtures/renderer-store");
+const { homePage } = require("../fixtures/home-page");
+const { persistSelection } = require("../../main/dist/electron/features/profiles/persist-selection");
+const { profilePage, proxiesPage } = require("../fixtures/profile-pages");
+const yaml = require("../../main/node_modules/yaml");
+const { refreshProfile } = require("../../main/dist/electron/entry/renderer/refresh-profile");
+const { createRendererConfiguration } = require("../../main/dist/electron/entry/renderer/configuration");
+const { createProfilesRepository } = require("../../main/dist/electron/features/profiles/profiles-repository");
+const { createLatencyPolicy } = require("../../main/dist/electron/features/proxies/latency-policy");
+
+const root = path.resolve(__dirname, "../../..");
+const targets = {
+    "win32:x64": {
+        clash: "app/clash_core/win_x64/static/files/win/x64/clash-win64.exe",
+        mihomo: "app/clash_core/win_x64/static/files/win/x64/mihomo-windows-amd64.exe"
+    },
+    "win32:arm64": {
+        clash: "app/clash_core/win32-arm64/static/files/win/arm64/clash-win-arm64.exe",
+        mihomo: "app/clash_core/win32-arm64/static/files/win/arm64/mihomo-windows-arm64.exe"
+    },
+    "linux:x64": {
+        clash: "app/clash_core/linux-x64/static/files/linux/x64/clash-linux",
+        mihomo: "app/clash_core/linux-x64/static/files/linux/x64/mihomo-linux-amd64"
+    },
+    "linux:arm64": {
+        clash: "app/clash_core/linux-arm64/static/files/linux/arm64/clash-linux",
+        mihomo: "app/clash_core/linux-arm64/static/files/linux/arm64/mihomo-linux-arm64"
+    },
+    "darwin:x64": {
+        clash: "app/clash_core/darwin-x64/static/files/darwin/x64/clash-darwin",
+        mihomo: "app/clash_core/darwin-x64/static/files/darwin/x64/mihomo-darwin-amd64"
+    },
+    "darwin:arm64": {
+        clash: "app/clash_core/darwin-arm64/static/files/darwin/arm64/clash-darwin",
+        mihomo: "app/clash_core/darwin-arm64/static/files/darwin/arm64/mihomo-darwin-arm64"
+    }
+};
+const platformTargets = targets[`${process.platform}:${process.arch}`];
+
+async function freePort(excluded = []) {
+    // The mixed listener needs both TCP and UDP; a TCP-only probe can select a
+    // port reserved for UDP by Windows or already occupied by another process.
+    for (let attempt = 0; attempt < 100; attempt++) {
+        const port = await new Promise((resolve, reject) => {
+            const server = net.createServer();
+            server.unref();
+            server.once("error", error => ["EACCES", "EADDRINUSE"].includes(error.code) ? resolve(0) : reject(error));
+            // Windows may allocate successive TCP ports inside a UDP-excluded
+            // range. Escape that range instead of repeating ephemeral picks.
+            const candidate = attempt < 8 ? 0 : randomInt(1024, 65536);
+            server.listen(candidate, "127.0.0.1", () => {
+                const { port } = server.address();
+                if (excluded.includes(port)) return server.close(() => resolve(0));
+                const udp = dgram.createSocket("udp4");
+                udp.once("error", error => {
+                    udp.close();
+                    server.close(() => ["EACCES", "EADDRINUSE"].includes(error.code) ? resolve(0) : reject(error));
+                });
+                udp.bind(port, "127.0.0.1", () => {
+                    udp.close(() => server.close(error => error ? reject(error) : resolve(port)));
+                });
+            });
+        });
+        if (port) return port;
+    }
+    throw Error("Could not find an available loopback TCP/UDP port");
+}
+
+function request(port, method, pathname, payload) {
+    const body = payload === undefined ? "" : JSON.stringify(payload);
+    return new Promise((resolve, reject) => {
+        const req = http.request({
+            hostname: "127.0.0.1",
+            port,
+            path: pathname,
+            method,
+            headers: {
+                Authorization: "Bearer compatibility-test",
+                ...(body ? {
+                    "Content-Type": "application/json",
+                    "Content-Length": Buffer.byteLength(body)
+                } : {})
+            }
+        }, response => {
+            let data = "";
+            response.setEncoding("utf8");
+            response.on("data", chunk => { data += chunk; });
+            response.on("end", () => resolve({ status: response.statusCode, data }));
+        });
+        req.on("error", reject);
+        req.setTimeout(1000, () => req.destroy(new Error("request timed out")));
+        req.end(body);
+    });
+}
+
+async function waitForApi(port, child, output) {
+    const deadline = Date.now() + 12000;
+    while (Date.now() < deadline) {
+        if (child.exitCode !== null) throw new Error(`core exited early\n${output.value}`);
+        try {
+            const response = await request(port, "GET", "/version");
+            if (response.status === 200) return response;
+        } catch (_) {}
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    throw new Error(`core API did not start\n${output.value}`);
+}
+
+async function stopChild(child) {
+    if (child.exitCode !== null) return;
+    const exited = new Promise(resolve => child.once("exit", resolve));
+    child.kill();
+    await Promise.race([
+        exited,
+        new Promise((_, reject) => setTimeout(
+            () => reject(new Error(`core process ${child.pid} did not exit`)),
+            5000
+        ))
+    ]);
+}
+
+async function queryDns(port) {
+    const socket = dgram.createSocket("udp4");
+    // A fake-IP query is answered locally, without contacting an external DNS server.
+    const name = Buffer.concat([Buffer.from([8]), Buffer.from("rollback"), Buffer.from([7]), Buffer.from("invalid"), Buffer.from([0])]);
+    const query = Buffer.concat([Buffer.from([0x42, 0x10, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]), name, Buffer.from([0, 1, 0, 1])]);
+    return new Promise(resolve => {
+        let timer;
+        const finish = result => { clearTimeout(timer); socket.close(); resolve(result); };
+        socket.once("error", () => finish(false));
+        socket.once("message", message => finish(message.readUInt16BE(0) === 0x4210 && message.readUInt16BE(6) > 0));
+        timer = setTimeout(() => finish(false), 250);
+        socket.send(query, port, "127.0.0.1");
+    });
+}
+
+async function verifyTapRollback(api) {
+    const dnsPort = await freePort();
+    let activeSource = "dns: {enable: false}\nrules: ['MATCH,DIRECT']\n";
+    let answered = false;
+    const vm = { settings: { legacyTapMode: "enabled" }, isTunEnable: false, isMixinEnable: false,
+        profiles: { index: 0, files: [{ time: "base.yaml" }] }, profilesPath: "virtual", confData: {}, menuItems: [],
+        clashApi: { ...api, putConfig: ({ payload }, options) => {
+            const content = yaml.parse(payload);
+            // Only native DNS binding is redirected: application policy still sees :53.
+            if (content.dns?.listen === ":53") content.dns.listen = `127.0.0.1:${dnsPort}`;
+            return api.putConfig({ payload: yaml.stringify(content) }, options);
+        } },
+        setCurrentProfilePayload({ payload }) { this.currentProfilePayload = payload; },
+        setMenuItems({ items }) { this.menuItems = items; }, resetDNS() {}, killSpawned() {},
+        async spawnTun2socks() {
+            for (let tries = 0; tries < 8 && !answered; tries++) answered = await queryDns(dnsPort);
+            assert.equal(answered, true, "the real core must have applied DNS before the simulated TAP failure");
+            throw Error("simulated TAP route failure after core apply");
+        }
+    };
+    const deps = { yaml, platform: "win32", messages: {}, readProfileSource: async () => activeSource, profileNetworkEffects: { hasTap: async () => true } };
+    assert.equal((await refreshProfile(vm, deps)).success, true);
+    activeSource = "interface-name: Ethernet\ndns: {enable: true, listen: ':53', enhanced-mode: fake-ip, nameserver: ['127.0.0.1:9']}\nrules: ['MATCH,REJECT']\n";
+    vm.profiles = { index: 0, files: [{ time: "tap.yaml" }] };
+    const result = await refreshProfile(vm, deps);
+    assert.equal(result.success, false);
+    assert.match(result.message, /simulated TAP route failure/);
+    assert.equal(result.rolledBack, true);
+    assert.equal(result.restoredProfileTime, "base.yaml");
+    assert.equal(vm.currentProfilePayload.dns.enable, false);
+    assert.equal(await queryDns(dnsPort), false, "rollback must actually stop the real core's failed-attempt DNS listener");
+    const rules = await api.getRules();
+    assert.equal(rules.data.rules.at(-1).proxy, "DIRECT");
+}
+
+async function verifyManualPortEdit(api, initialPort, home) {
+    const file = path.join(home, "config.yaml");
+    const persist = async port => {
+        const config = yaml.parse(fs.readFileSync(file, "utf8"));
+        config["mixed-port"] = port;
+        fs.writeFileSync(file, yaml.stringify(config));
+    };
+    const options = { clashApi: api, persist, sleep: delay => new Promise(resolve => setTimeout(resolve, delay)),
+        checkAvailable: async port => isMixedPortAvailable({ net, dgram, port, config: (await api.getConfig()).data }) };
+    for (const protocol of ["tcp", "udp"]) {
+        const port = await freePort([initialPort]);
+        const socket = protocol === "tcp" ? net.createServer() : dgram.createSocket("udp4");
+        await new Promise((resolve, reject) => {
+            socket.once("error", reject);
+            if (protocol === "tcp") socket.listen(port, "127.0.0.1", resolve);
+            else socket.bind(port, "127.0.0.1", resolve);
+        });
+        try {
+            await assert.rejects(setManualMixedPort({ ...options, port }), { reason: "unavailable" });
+            assert.equal((await api.getConfig()).data["mixed-port"], initialPort);
+            assert.equal(yaml.parse(fs.readFileSync(file, "utf8"))["mixed-port"], initialPort);
+        } finally { await new Promise(resolve => socket.close(resolve)); }
+    }
+    const candidate = await freePort([initialPort]);
+    await assert.rejects(setManualMixedPort({ ...options, port: candidate, persist: async () => { throw Error("simulated read-only profile"); } }), { reason: "persist" });
+    assert.equal((await api.getConfig()).data["mixed-port"], initialPort, "disk failures must restore the real listener");
+    assert.equal(await options.checkAvailable(candidate), true, "rollback must release the attempted port");
+    const tcp = net.createServer(), udp = dgram.createSocket("udp4");
+    try {
+        await new Promise((resolve, reject) => { tcp.once("error", reject); tcp.listen(candidate, "127.0.0.2", resolve); });
+        await new Promise((resolve, reject) => { udp.once("error", reject); udp.bind(candidate, "127.0.0.2", resolve); });
+        assert.equal(await setManualMixedPort({ ...options, port: candidate }), candidate);
+        assert.equal((await api.getConfig()).data["mixed-port"], candidate);
+        assert.equal(yaml.parse(fs.readFileSync(file, "utf8"))["mixed-port"], candidate);
+        await setManualMixedPort({ ...options, port: candidate, checkAvailable: () => { throw Error("same-port edit must not rebind"); } });
+        await setManualMixedPort({ ...options, port: initialPort });
+    } finally {
+        await Promise.all([tcp, udp].map(socket => new Promise(resolve => { try { socket.close(resolve); } catch { resolve(); } })));
+    }
+}
+
+async function verifyFreshDefault(api, home, coreName) {
+    const vm = { clashPath: home, profilesPath: path.join(home, "profiles"), clashApi: api,
+        confData: yaml.parse(fs.readFileSync(path.join(home, "config.yaml"), "utf8")),
+        settings: { proxyCore: coreName, legacyTapMode: "disabled", mixinText: "mixin:\n  rules: ['MATCH,REJECT']\n" },
+        isMixinEnable: false, isTunEnable: false, menuItems: [],
+        setCurrentProfilePayload() {}, setMenuItems({ items }) { this.menuItems = items; }, resetDNS() {}, killSpawned() {} };
+    createRendererConfiguration(vm, { fs, path, yaml }).initializeProfiles();
+    vm.profiles = createProfilesRepository({ fs, path, yaml }).load(vm.profilesPath);
+    assert.equal(vm.profiles.index, 0, "startup must select its default without mounting Profiles");
+    const deps = { fs, path, yaml, platform: process.platform, messages: {}, profileNetworkEffects: { hasTap: async () => false } };
+    assert.equal((await refreshProfile(vm, deps)).success, true);
+    vm.isMixinEnable = true;
+    assert.equal((await refreshProfile(vm, deps)).success, true);
+    assert.equal((await api.getRules()).data.rules.at(-1).proxy, "REJECT");
+    vm.isMixinEnable = false;
+    assert.equal((await refreshProfile(vm, deps)).success, true);
+    assert.equal((await api.getRules()).data.rules.length, 0);
+}
+
+async function verifyCore(coreName, relativeBinary) {
+    const binary = path.join(root, relativeBinary);
+    if (process.platform !== "win32") fs.chmodSync(binary, 0o755);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), `cfw-${coreName}-`));
+    const controllerPort = await freePort();
+    const initialMixedPort = await freePort([controllerPort]);
+    const updatedMixedPort = await freePort([controllerPort, initialMixedPort]);
+    fs.copyFileSync(
+        path.join(root, "app/clash_core/win_x64/static/files/default/Country.mmdb"),
+        path.join(home, "Country.mmdb")
+    );
+    fs.writeFileSync(path.join(home, "config.yaml"), [
+        `mixed-port: ${initialMixedPort}`,
+        `external-controller: 127.0.0.1:${controllerPort}`,
+        "secret: compatibility-test",
+        "mode: direct",
+        "log-level: info",
+        "proxies: []",
+        "proxy-groups: []",
+        "rules: []",
+        ""
+    ].join("\n"));
+
+    const output = { value: "" };
+    const child = spawn(binary, ["-d", home], {
+        cwd: path.dirname(binary),
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"]
+    });
+    child.stdout.on("data", chunk => { output.value += chunk; });
+    child.stderr.on("data", chunk => { output.value += chunk; });
+    try {
+        const version = await waitForApi(controllerPort, child, output);
+        assert.match(version.data, /version/i);
+        const apiCalls = [];
+        const client = Object.fromEntries(["get", "put", "patch", "delete"].map(method => [method, async (url, payload) => {
+            apiCalls.push([method, url]);
+            const query = method === "get" && payload?.params ? `?${new URLSearchParams(payload.params)}` : "";
+            const response = await request(controllerPort, method.toUpperCase(), url + query, ["get", "delete"].includes(method) ? undefined : payload);
+            return { status: response.status, data: response.data ? JSON.parse(response.data) : "" };
+        }]));
+        const api = createClashApi({ getClient: () => client });
+        // /version responds before the initial YAML finishes applying. A mode
+        // PATCH sent in that window can be overwritten by startup's Direct mode.
+        await waitForInitialConfig({ request: () => request(controllerPort, "GET", "/configs"), child, mixedPort: initialMixedPort });
+        await verifyFreshDefault(api, home, coreName);
+        await verifyManualPortEdit(api, initialMixedPort, home);
+        // Confirm forwarding is running before changing any configuration.
+        try { await verifyDisconnect(api, initialMixedPort); }
+        catch (error) {
+            const listenerLogs = output.value.split(/\r?\n/).filter(line => /listen|bind|mixed|warn|error/i.test(line) && !/secret|authorization|bearer/i.test(line));
+            throw new Error(`${error.message}\n${listenerLogs.join("\n")}`);
+        }
+        const scriptModeResponse = await request(controllerPort, "PATCH", "/configs", { mode: "script" });
+        const modeAfterScriptRequest = JSON.parse((await request(controllerPort, "GET", "/configs")).data).mode;
+        if (coreName === "clash") {
+            assert.equal(scriptModeResponse.status, 204, scriptModeResponse.data || output.value);
+            assert.equal(modeAfterScriptRequest, "script");
+        } else {
+            assert.notEqual(scriptModeResponse.status, 204, "Mihomo unexpectedly accepted legacy Script mode");
+            assert.notEqual(modeAfterScriptRequest, "script");
+        }
+        const restoreMode = await request(controllerPort, "PATCH", "/configs", { mode: "direct" });
+        assert.equal(restoreMode.status, 204, restoreMode.data || output.value);
+        const patch = await request(controllerPort, "PATCH", "/configs", {
+            "mixed-port": updatedMixedPort
+        });
+        assert.equal(patch.status, 204, patch.data || output.value);
+        const config = await request(controllerPort, "GET", "/configs");
+        assert.equal(config.status, 200, config.data);
+        assert.equal(JSON.parse(config.data)["mixed-port"], updatedMixedPort);
+        fs.writeFileSync(path.join(home, "application.yaml"), [
+            "proxies: []", "proxy-groups:", "  - name: app-test", "    type: select",
+            "    proxies: [DIRECT, REJECT]", 'rules: ["MATCH,DIRECT"]'
+        ].join("\n"));
+        fs.writeFileSync(path.join(home, "list.yml"), JSON.stringify({ index: 0, files: [{ time: "application.yaml", mode: "rule", selected: [{ name: "app-test", now: "REJECT" }] }] }));
+        const { store } = buildStore({ home, axios: { create: () => client } });
+        store.commit("LOAD_PROFILES");
+        store.commit("SET_CONF_DATA", { data: { ipv6: false, "log-level": "warning", "external-controller": `127.0.0.1:${controllerPort}` } });
+        const model = {
+            profilesPath: home,
+            get profiles() { return store.state.app.profiles; },
+            get pfs() { return store.state.app.profiles; },
+            get settings() { return store.state.app.settings; },
+            get confData() { return store.state.app.confData; },
+            get menuItems() { return store.state.app.menuItems; },
+            get clashApi() { return store.getters.clashApi; },
+            setCurrentProfilePayload: payload => store.commit("SET_CURRENT_PROFILE_PAYLOAD", payload),
+            setMenuItems: payload => store.commit("SET_MENU_ITEMS", payload), resetDNS() {}, killSpawned() {},
+            changeProfile: payload => store.commit("CHANGE_PROFILE", payload),
+            switchMode: mode => store.dispatch("setMode", { mode })
+        };
+        const onProfileApplied = () => store.commit("ADD_PROFILE_REFRESH_TIMES", { times: 1 });
+        model.refreshProfile = bundledRefresh(process.platform, 1, onProfileApplied).bind(model);
+        const dialogs = [];
+        const profilesUi = profilePage({ store, parent: model, dialogs, downloadProfile: async () => {
+            fs.writeFileSync(path.join(home, "application.yaml"), "proxy-groups:\n  - name: updated-subscription\n    type: select\n    proxies: [DIRECT, REJECT]\nrules: []\n");
+            return { success: true, targetIndex: 0 };
+        } });
+        await profilesUi.handleProfileClick(0);
+        assert.equal(dialogs.length, 0);
+        assert.equal(profilesUi.loadingProfileIndex.length, 0);
+        const applied = await api.getConfig();
+        assert.equal(applied.data.mode, "rule");
+        assert.equal(applied.data["mixed-port"], updatedMixedPort);
+        assert.equal(applied.data["log-level"], coreName === "clash" ? "warn" : "warning");
+        const proxies = await api.getProxies();
+        assert.equal(proxies.data.proxies["app-test"].now, "REJECT");
+        assert.equal(store.state.app.currentProfilePayload["proxy-groups"][0].name, "app-test");
+        assert.equal(store.state.app.mode, "rule");
+        const proxiesUi = proxiesPage(store, 1, true);
+        await proxiesUi.fetchData();
+        assert.equal(proxiesUi.proxyInMode.some(group => group.name === "app-test"), true);
+        assert.equal(proxiesUi.proxyInMode.find(group => group.name === "app-test").data.now, "REJECT");
+        await homePage({ persistSelection }).methods.persistSelectedProxy.call(model);
+        const restarted = buildStore({ home }).store;
+        restarted.commit("LOAD_PROFILES");
+        assert.equal(restarted.state.app.profiles.files[0].selected.find(group => group.name === "app-test").now, "REJECT");
+
+        const originalInstance = proxiesUi._uid;
+        store.commit("SAVE_SETTINGS_OBJECT", { obj: { ...store.state.app.settings, selectAfterUpdated: false } });
+        assert.equal(await profilesUi.updateConfig({ url: "https://subscription.test/active", selectAfterUpdated: false }), true);
+        const refreshDeadline = Date.now() + 3000;
+        while (!proxiesUi.proxies.some(group => group.name === "updated-subscription") && Date.now() < refreshDeadline) {
+            await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        assert.equal(proxiesUi.proxyInMode.some(group => group.name === "updated-subscription"), true);
+        assert.equal(proxiesUi.proxyInMode.some(group => group.name === "app-test"), false);
+        assert.equal(proxiesUi._uid, originalInstance);
+        assert.equal(store.state.app.profiles.index, 0);
+        const successfulRevision = store.state.app.profileRefreshTimes;
+
+        // Exercise malformed YAML and core-level validation through the actual click handlers.
+        fs.writeFileSync(path.join(home, "broken.yaml"), "proxy-groups: [\n");
+        fs.writeFileSync(path.join(home, "invalid.yaml"), "proxy-groups:\n  - name: invalid\n    type: no-such-type\n");
+        store.commit("APPEND_PROFILE", { profile: { time: "broken.yaml" } });
+        store.commit("APPEND_PROFILE", { profile: { time: "invalid.yaml" } });
+        const writesBeforeSyntaxError = apiCalls.filter(([method, url]) => method === "put" && url === "/configs").length;
+        await profilesUi.handleProfileClick(1);
+        assert.equal(dialogs.length, 1);
+        assert.equal(dialogs[0].type, "error");
+        assert.match(dialogs[0].detail, /Error:/);
+        assert.equal(store.state.app.profiles.index, -1);
+        assert.equal(apiCalls.filter(([method, url]) => method === "put" && url === "/configs").length, writesBeforeSyntaxError);
+        await profilesUi.handleProfileClick(2);
+        assert.equal(dialogs.length, 2);
+        assert.ok(dialogs[1].detail.length > 0);
+        assert.equal(store.state.app.profiles.index, -1);
+        assert.equal(profilesUi.loadingProfileIndex.length, 0);
+        assert.equal(apiCalls.filter(([method, url]) => method === "put" && url === "/configs").length, writesBeforeSyntaxError + 1);
+        await proxiesUi.fetchData();
+        assert.equal(proxiesUi.proxyInMode.some(group => group.name === "updated-subscription"), true);
+        assert.equal(store.state.app.profileRefreshTimes, successfulRevision);
+
+        // A subsequent valid selection must replace the visible groups, including in Chinese.
+        fs.writeFileSync(path.join(home, "second.yaml"), "proxy-groups:\n  - name: second-profile\n    type: select\n    proxies: [DIRECT, REJECT]\nrules: []\n");
+        store.commit("APPEND_PROFILE", { profile: { time: "second.yaml", mode: "rule" } });
+        model.refreshProfile = bundledRefresh(process.platform, 0, onProfileApplied).bind(model);
+        await profilesUi.handleProfileClick(3);
+        assert.equal(dialogs.length, 2);
+        assert.equal(store.state.app.profiles.index, 3);
+        await proxiesUi.fetchData();
+        assert.equal(proxiesUi.proxyInMode.some(group => group.name === "second-profile"), true);
+        assert.equal(proxiesUi.proxyInMode.some(group => group.name === "app-test"), false);
+        proxiesUi.$destroy();
+        await verifyTapRollback(api);
+        await verifyMeanDelay(coreName, api);
+    } finally {
+        await stopChild(child);
+        fs.rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+}
+
+async function verifyMeanDelay(core, api) {
+    let requests = 0;
+    const server = http.createServer((_request, response) => {
+        const delay = ++requests === 1 ? 20 : 80;
+        setTimeout(() => { response.writeHead(204); response.end(); }, delay);
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+        const policy = createLatencyPolicy(), samples = [];
+        const url = `http://127.0.0.1:${server.address().port}/delay`;
+        const mean = await policy.measure({ name: "DIRECT", core, kind: "meanDelay", timeout: 2000,
+            sample: async timeout => {
+                const response = await api.testProxyDelay("DIRECT", { params: { timeout, url } });
+                assert.equal(response.status, 200);
+                samples.push(response.data);
+                return response.data;
+            } });
+        assert.equal(requests, 2, `${core} mean mode must measure two actual HTTP requests`);
+        assert.equal(samples.length, core === "mihomo" ? 2 : 1);
+        assert.equal(mean, core === "mihomo" ? Math.round((samples[0].delay + samples[1].delay) / 2) : samples[0].meanDelay);
+        const history = (await api.getProxies()).data.proxies.DIRECT.history;
+        assert.equal(policy.read({ name: "DIRECT", kind: "meanDelay", history }), mean);
+    } finally { await new Promise(resolve => server.close(resolve)); }
+}
+
+for (const coreName of ["clash", "mihomo"]) {
+    test(`${coreName}: profile clicks validate YAML, apply configuration and update the Proxies page`, {
+        skip: !platformTargets
+    }, async () => {
+        await verifyCore(coreName, platformTargets[coreName]);
+    });
+}

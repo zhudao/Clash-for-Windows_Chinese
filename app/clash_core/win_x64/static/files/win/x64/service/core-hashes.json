@@ -1,0 +1,19 @@
+{
+  "cores": [
+    {
+      "name": "clash-win64.exe",
+      "sha256": "9AE78ED7542A4DA6EC05393DA16B5636FCE841E35EFD18D542F063AE78EDC25B"
+    },
+    {
+      "name": "mihomo-windows-amd64.exe",
+      "sha256": "926BFEA2CE48A247D6A7CE4CF641980E416202D5E40FE4EE5C949089ACE0E197"
+    }
+  ],
+  "dependencies": [
+    {
+      "core": "clash-win64.exe",
+      "name": "wintun.dll",
+      "sha256": "E5DA8447DC2C320EDC0FC52FA01885C103DE8C118481F683643CACC3220DAFCE"
+    }
+  ]
+}

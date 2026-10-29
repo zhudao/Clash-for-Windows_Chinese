@@ -1,0 +1,12 @@
+{
+  "cores": [
+    {
+      "name": "clash-linux",
+      "sha256": "26A48E936F2DD20DE4936E41E69ABC27C909F69C0593DD30B48099BF31B583EE"
+    },
+    {
+      "name": "mihomo-linux-amd64",
+      "sha256": "817F50B3AC6A8B1C4360C5CF2961906057F3A883D970EBBCB0028A01632B620F"
+    }
+  ]
+}

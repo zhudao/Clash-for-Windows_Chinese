@@ -1,0 +1,1155 @@
+"use strict";
+
+const { compareVersions, releasePage, releasesUrl } = require("../../core/release/release-info");
+const { selectReleaseAsset } = require("../../core/release/update-policy");
+
+const { shouldCloseWindowForShortcut } = require("./window-shortcut-policy");
+const { createPacFeedback } = require("./pac-feedback");
+const { createCoreStatusPoller } = require("./core-status-poller");
+const { bindMenuShortcuts } = require("./menu-shortcuts");
+const { supportsScriptMode } = require("../../core/clash-core/core-capabilities");
+const { parsePort } = require("../../core/network/tcp-port");
+const { setManualMixedPort } = require("../../core/network/manual-mixed-port");
+const { waitForProfileRefresh } = require("../../core/network/profile-refresh-state");
+const { matchesCron } = require("../../core/time/cron-match");
+const { TAP_MODES, resolveTapMode } = require("../../core/network/legacy-tap-policy");
+const {
+    confirmMixedPortConflict,
+    recoverWithRandomPort
+} = require("../../core/network/mixed-port-recovery");
+
+function createMacDnsHelpers({ runMacCommand, net }) {
+    return {
+        async setDns(addresses) {
+            const result = await runMacCommand(["-dns", addresses.length > 0 ? addresses.join(",") : "reset"]);
+            return result.success;
+        },
+        async getDns() {
+            const result = await runMacCommand(["-dns", "query"]);
+            if (!result.success || !/.+?=(.+?);/.test(result.output)) return [];
+            return RegExp.$1.split(",").filter(address => net.isIP(address));
+        }
+    };
+}
+
+function createHomePageOptions(dependencies) {
+    const {
+        Vuex, lodash, components, cache, keys, connectionStatus, proxyStatus,
+        runtimeProcess, electron, path, fs, moment, scheduler, logger, os, httpClient,
+        yaml, sudoPrompt, validatePort, notify, showMessageBox, updateYaml, hash, sleep,
+        shouldReplaceWintun, detectInterface, store, defaultPac, getPort, startPacServer,
+        downloadProfile, net, runMacCommand, uuid, firewallRuleExists, getWlanInterfaces,
+        mousetrap, cron, serviceStatus, serviceActiveStatus, runtimeState,
+        getLanguage, refreshRendererProfile, refreshTapRuntime, createRendererConfiguration, persistSelection,
+        createTunRuntime, createClashCoreRuntime,
+        isMacOS, isWindows, isLinux
+    } = dependencies;
+    const { setDns, getDns } = createMacDnsHelpers({ runMacCommand, net });
+    const showPacFeedback = createPacFeedback({ getLanguage, showMessageBox });
+    const profileUpdateJobs = new WeakMap();
+    const startupProfiles = new WeakMap();
+    const startupState = vm => {
+        if (!startupProfiles.has(vm)) {
+            let finish;
+            const result = new Promise(resolve => { finish = resolve; });
+            startupProfiles.set(vm, { preparations: new Set(), revision: 0, result, finish });
+        }
+        return startupProfiles.get(vm);
+    };
+
+    function publishCertificateExceptions(settings = {}) {
+        let urls = [], origins = [];
+        try { urls = yaml.parse(settings.unsafeURLsText)?.urls || []; } catch (_error) {}
+        try { origins = yaml.parse(settings.unsafeURLOriginsText)?.origins || []; } catch (_error) {}
+        electron.ipcRenderer.send("set-allow-unsafe-urls", urls, origins, settings.allowHttpExternalLinks === true);
+    }
+
+
+    return {
+        name: "landing-page",
+        components,
+        data() {
+            return {
+                clash: null,
+                userPath: "",
+                clashRestfulPort: null,
+                clashRestfulSecret: "",
+                newVersionInfo: {},
+                shwoError: false,
+                showStartup: false,
+                portableMode: false,
+                startTime: null,
+                tun2socks: null,
+                pkgDownloadProgress: 0,
+                networkInterfaces: [],
+                configFileWatcher: null,
+                profileUpdateFailed: {},
+                profileUpdateFailedURLs: [],
+                shortcuts: {},
+                menuKeyboardClickTimes: 0,
+                isUserDNSChanged: false,
+                isResolvingMixedPortConflict: false,
+                isCoreRestarting: false,
+                isInitializing: true,
+                coreRunRevision: 0,
+                proxyOperation: "",
+                proxyTarget: null,
+                proxyRequestId: null,
+                modeChangeTask: null,
+                profileApplyCount: 0,
+                profileApplyRevision: 0,
+                isDetectingProfileInterface: false,
+                serviceOperation: "",
+                restoringAppliedProfileState: false,
+                clashMixedPort: -1
+            };
+        },
+        watch: {
+            proxyBusy: { immediate: true, handler() { this.publishProxyOperation(); } },
+            $route(route) {
+                if (route.path !== undefined) this.setCurrentRoutePath({ path: route.path });
+                if (route.path === "/home/server") this.profileUpdateFailedURLs = [];
+            },
+            isWindowShow: {
+                immediate: true,
+                handler(value) { if (value) scheduler.resumeAll(); else scheduler.pauseAll(); }
+            },
+            async clashMixedPort(value) {
+                if (value !== 0) return;
+                await this.checkMixedPortConflict();
+            },
+            mixedPort() {
+                logger.info("mixed-port changed");
+                this.resetSystemProxySettings();
+            },
+            controllerPort() { logger.info("external controller port changed"); },
+            finalInterfaceName(value) {
+                logger.info(`new outbound interface: ${value}`);
+                // Interface detection during an apply already supplies that interface.
+                if (!this.isDetectingProfileInterface && !this.serviceOperation) this.refreshProfile();
+            },
+            async clashStatus(value) {
+                logger.info(`clash status change to [${value === connectionStatus.CONNECTED ? getLanguage().connected() : "断开连接"}]`);
+                electron.ipcRenderer.send("clash-core-status-change", value === connectionStatus.CONNECTED ? 0 : 1);
+                if (value === connectionStatus.CONNECTED) {
+                    // Startup may still be replacing an old responding core.
+                    if (this.isInitializing) return;
+                    await this.refreshProfile().catch(() => {});
+                    this.setIsLaunching({ isLaunching: false });
+                    await this.checkMixedPortConflict();
+                }
+            },
+            clashAxiosClient(client) {
+                logger.info("clash axios client changed");
+                electron.ipcRenderer.send("clash-core-info", { port: this.controllerPort, secret: this.secret });
+                if (!client) return;
+                client.interceptors.request.use(config => {
+                    this.addClashAxiosFlyingRequestCount({ count: 1 });
+                    return config;
+                }, error => Promise.reject(error));
+                client.interceptors.response.use(response => {
+                    this.addClashAxiosFlyingRequestCount({ count: -1 });
+                    return response;
+                }, error => {
+                    this.addClashAxiosFlyingRequestCount({ count: -1 });
+                    return Promise.reject(error);
+                });
+            },
+            status: {
+                immediate: true,
+                handler(value) {
+                    this.updateTrayIcon();
+                    electron.ipcRenderer.send("system-proxy-changed", value === proxyStatus.SYSTEM_PROXY);
+                }
+            },
+            "settings.hideTrayIcon": {
+                immediate: true,
+                async handler(value) {
+                    await electron.ipcRenderer.invoke("tray-create-destroy", value ? "destroy" : "create");
+                    this.updateTrayIcon();
+                }
+            },
+            "settings.trayProxiesStyle": {
+                immediate: true,
+                async handler(value) { await electron.ipcRenderer.invoke("tray-proxies-style", value || 0); }
+            },
+            "settings.showTrayProxyDelayIndicator": {
+                immediate: true,
+                async handler(value) { await electron.ipcRenderer.invoke("tray-proxies-icon", value || false); }
+            },
+            "settings.useModeIcons"() { this.updateTrayIcon(); },
+            "settings.proxyCore"(value) {
+                electron.ipcRenderer.send("core-type-changed", value);
+                this.rebindScriptModeShortcut(this.settings.shortcutScriptMode);
+                if (!supportsScriptMode(value) && this.mode === "script") this.switchMode("rule");
+            },
+            "settings.iconDefault"() { this.updateTrayIcon(); },
+            "settings.iconSystemProxy"() { this.updateTrayIcon(); },
+            fontFamily: {
+                immediate: true,
+                handler(value) { document.body.style.fontFamily = value; }
+            },
+            "settings.shortcutSystemProxy"(value, previousValue) {
+                this.rebindShortcut(value, previousValue, async () => {
+                    await this.requestSystemProxy(!this.isSystemProxyOn);
+                }, "shortcutSystemProxy");
+            },
+            "settings.shortcutTun"(value, previousValue) {
+                this.rebindShortcut(value, previousValue, async () => {
+                    const enabled = !this.isTunEnable;
+                    if (await this.requestProfileToggle("tun", enabled)) notify("Shortcut", `TUN Mode: ${enabled ? "On" : "Off"}`);
+                }, "shortcutTun");
+            },
+            "settings.shortcutMixin"(value, previousValue) {
+                this.rebindShortcut(value, previousValue, async () => {
+                    const enabled = !this.isMixinEnable;
+                    if (await this.requestProfileToggle("mixin", enabled)) notify("Shortcut", `Mixin: ${enabled ? "On" : "Off"}`);
+                }, "shortcutMixin");
+            },
+            "settings.shortcutGlobalMode"(value, previousValue) { this.rebindShortcut(value, previousValue, () => this.requestRoutingMode("global"), "shortcutGlobalMode"); },
+            "settings.shortcutRuleMode"(value, previousValue) { this.rebindShortcut(value, previousValue, () => this.requestRoutingMode("rule"), "shortcutRuleMode"); },
+            "settings.shortcutDirectMode"(value, previousValue) { this.rebindShortcut(value, previousValue, () => this.requestRoutingMode("direct"), "shortcutDirectMode"); },
+            "settings.shortcutScriptMode"(value, previousValue) { this.rebindScriptModeShortcut(value, previousValue); },
+            "settings.shortcutRunTrayScript"(value, previousValue) { this.rebindShortcut(value, previousValue, this.runTrayScript, "shortcutRunTrayScript"); },
+            "settings.shortcutShowHideDashboard"(value, previousValue) {
+                this.rebindShortcut(value, previousValue, () => electron.ipcRenderer.invoke("window-control", "show-or-hide"), "shortcutShowHideDashboard");
+            },
+            "settings.systemProxyTypeIndex"() { this.resetSystemProxySettings(); },
+            "settings.pacContentText"() { this.resetSystemProxySettings(); },
+            "settings.bypassText"() { this.resetSystemProxySettings(); },
+            "settings.specifyHttpProxyProtocol"() { this.resetSystemProxySettings(); },
+            "settings.staticSystemProxyHost"() { this.resetSystemProxySettings(); },
+            "settings.enableDHCPServer"(enabled) {
+                if (enabled) {
+                    if (!this.menuItems.some(item => item.path === "/home/router")) {
+                        this.setMenuItems({ items: [...this.menuItems, { path: "/home/router" }] });
+                    }
+                } else {
+                    this.setMenuItems({ items: this.menuItems.filter(item => item.path !== "/home/router") });
+                }
+            },
+            isMixinEnable(value) {
+                if (!this.restoringAppliedProfileState) this.refreshProfile();
+                this.updateTrayIcon();
+                electron.ipcRenderer.send("mixin-changed", value);
+            },
+            "settings.mixinText"() {
+                const type = this.settings.mixinType;
+                // Default YAML edits apply after startup; loading old settings must not add a startup apply.
+                const defaultYamlEdit = Number(type || 0) === 0 && !this.isLaunching && !this.restoringAppliedProfileState;
+                if (this.isMixinEnable && (type === 0 || defaultYamlEdit)) this.refreshProfile();
+            },
+            "settings.mixinCode"() { if (this.isMixinEnable && this.settings.mixinType === 1) this.refreshProfile(); },
+            "settings.mixinType"() { this.refreshProfile(); },
+            "settings.legacyTapMode"(_value, previous) {
+                // Initial settings are applied by core startup, without another queued reload.
+                if (previous !== undefined && !this.isLaunching && !this.restoringAppliedProfileState) this.refreshProfile();
+            },
+            "settings.tapAllowMulticast"(_value, previous) {
+                if (previous !== undefined && !this.isLaunching && !this.restoringAppliedProfileState) this.refreshProfile();
+            },
+            "settings.disableLoadingAdsLink": {
+                immediate: true,
+                handler(value) {
+                    if (value !== false && cache.get(keys.AD_IMAGES) !== "") cache.put(keys.AD_IMAGES, "");
+                }
+            },
+            "settings.unsafeURLsText": {
+                immediate: true,
+                handler() { publishCertificateExceptions(this.settings); }
+            },
+            "settings.unsafeURLOriginsText": {
+                immediate: true,
+                handler() { publishCertificateExceptions(this.settings); }
+            },
+            "settings.allowHttpExternalLinks": {
+                immediate: true,
+                handler() { publishCertificateExceptions(this.settings); }
+            },
+            "settings.clashAuthentication"() { this.refreshProfile(); },
+            isTunEnable(value) {
+                this.updateTrayIcon();
+                if (!this.restoringAppliedProfileState) this.refreshProfile();
+                electron.ipcRenderer.send("tun-changed", value);
+            },
+            tunSettings() { if (this.isTunEnable) this.refreshProfile(); },
+            isAppSuspend(value) {
+                if (value) return;
+                // The refresh queue owns TAP restart and cancellation, including resume.
+                this.refreshProfile().catch(() => {});
+            },
+            innerServerPort(value) {
+                console.log("inner port:", value);
+                this.resetSystemProxySettings();
+            },
+            mode: {
+                immediate: true,
+                handler(value) {
+                    const task = (async () => {
+                        this.updateTrayIcon();
+                        electron.ipcRenderer.send("mode-changed", value);
+                        if (this.settings.connMode) await this.clashApi.closeConnections();
+                        const { files = [], index = -1 } = this.profiles;
+                        if (index >= 0 && files.length > index) this.changeProfile({ index, profile: { ...files[index], mode: value } });
+                    })();
+                    this.modeChangeTask = task;
+                    return task;
+                }
+            }
+        },
+        computed: {
+            coreRestorePending() {
+                return !!(this.isInitializing || this.isCoreRestarting || this.isLaunching || this.serviceOperation);
+            },
+            coreStatusPending() { return this.coreRestorePending || this.profileApplyCount > 0; },
+            serviceOperationHint() {
+                return this.serviceOperation === "restarting" ? getLanguage().serviceRestarting() : getLanguage().serviceApplying();
+            },
+            proxyBusy() {
+                return !!(this.proxyOperation || this.profileApplyCount || this.serviceOperation || this.isInitializing || this.isCoreRestarting || this.isLaunching || this.isResolvingMixedPortConflict);
+            },
+            ...Vuex.mapState({
+                pfs: state => state.app.profiles,
+                devMode: state => state.app.isDevMode,
+                profiles: state => state.app.profiles,
+                clashPath: state => state.app.clashPath,
+                clashStatus: state => state.app.clashStatus,
+                confData: state => state.app.confData,
+                profilesPath: state => state.app.profilesPath,
+                isMixinEnable: state => state.app.isMixinEnable,
+                isTunEnable: state => state.app.isTunEnable,
+                status: state => state.app.status,
+                clashAxiosFlyingRequestCount: state => state.app.clashAxiosFlyingRequestCount,
+                logFilePath: state => state.app.logFilePath,
+                shouldUseDarkTheme: state => state.app.shouldUseDarkTheme,
+                detectedInterfaceName: state => state.app.detectedInterfaceName,
+                isAppSuspend: state => state.app.isAppSuspend,
+                innerServerPort: state => state.app.innerServerPort,
+                isLocalMode: state => state.app.isLocalMode,
+                isLaunching: state => state.app.isLaunching,
+                isWindowShow: state => state.app.isWindowShow,
+                menuItems: state => state.app.menuItems,
+                isSystemProxyOn: state => state.app.isSystemProxyOn,
+                isSubViewShow: state => state.app.isSubViewShow,
+                currentRoutePath: state => state.app.currentRoutePath,
+                mode: state => state.app.mode,
+                isSilentUpgraded: state => state.app.isSilentUpgraded,
+                tunSettings: state => state.app.tunSettings,
+                userDNS: state => state.app.userDNS
+            }),
+            ...Vuex.mapGetters(["resourcesPath", "filesPath", "mixedPort", "controllerPort", "secret", "clashAxiosClient", "clashGotClient", "fontFamily", "clashBinaryPath", "menuItemsWithOrder"]),
+            finalInterfaceName() { return this.settings.interfaceName || this.detectedInterfaceName; },
+            statusHint() {
+                if (this.pkgDownloadProgress > 0 && this.pkgDownloadProgress < 1) return `Download progress: ${(100 * this.pkgDownloadProgress).toFixed(2)}%`;
+                if (this.clashStatus === connectionStatus.CONNECTED) return getLanguage().connected();
+                if (this.clashStatus === connectionStatus.DISCONNECTED) return getLanguage().disconnected();
+                return undefined;
+            },
+            statusIcon() {
+                return {
+                    "clash-status-icon": true,
+                    "clash-running": this.clashStatus === connectionStatus.CONNECTED,
+                    "clash-stopped": this.clashStatus === connectionStatus.DISCONNECTED
+                };
+            }
+        },
+        methods: {
+            publishProxyOperation(requestId = this.proxyRequestId) {
+                const state = { busy: this.proxyBusy, operation: this.proxyOperation, target: this.proxyTarget, requestId };
+                this.$store?.commit("SET_PROXY_OPERATION_STATE", { state });
+                electron.ipcRenderer.send("proxy-operation-state", state);
+            },
+            publishProxyState() {
+                electron.ipcRenderer.send("tun-changed", this.isTunEnable);
+                electron.ipcRenderer.send("mixin-changed", this.isMixinEnable);
+                electron.ipcRenderer.send("system-proxy-changed", this.isSystemProxyOn);
+            },
+            async runProxyOperation(name, action, target = null, requestId = null) {
+                if (this.proxyBusy) { this.publishProxyState(); this.publishProxyOperation(requestId); return false; }
+                this.proxyOperation = name;
+                this.proxyTarget = target;
+                this.proxyRequestId = requestId;
+                this.publishProxyOperation();
+                try { return await action(); }
+                catch (error) {
+                    const title = name === "tun" ? "TUN Mode" : name === "mixin" ? getLanguage().mixin() : name === "tap" ? getLanguage().tapAdapter() : name === "mode" ? getLanguage().proxyMode() : name === "profile" ? getLanguage().profiles() : getLanguage().sysProxy();
+                    // A failed explicit action must remain visible with notifications disabled.
+                    if (this.$alert) {
+                        try { await this.$alert({ title, content: error.message }); } catch (_dismissed) {}
+                    } else notify(title, error.message, { silent: false });
+                    return false;
+                } finally {
+                    this.proxyOperation = ""; this.proxyTarget = null;
+                    this.publishProxyState(); this.publishProxyOperation();
+                    this.proxyRequestId = null;
+                }
+            },
+            requestSystemProxy(enabled, requestId = null) {
+                return this.runProxyOperation("system", async () => {
+                    const success = await this.$setSystemProxy(enabled, this.confData);
+                    if (success) this.setIsSystemProxyOn({ isOn: enabled });
+                    return success;
+                }, enabled, requestId);
+            },
+            requestProfileSelection(action) {
+                return this.runProxyOperation("profile", action);
+            },
+            requestProfileToggle(kind, enabled, requestId = null) {
+                if (kind === "tap" && !TAP_MODES.includes(enabled)) return Promise.resolve(false);
+                if (kind === "tapMulticast" && typeof enabled !== "boolean") return Promise.resolve(false);
+                return this.runProxyOperation(kind, async () => {
+                    if (kind === "mixin" && enabled) await dependencies.prepareMixin(this.settings);
+                    const previous = kind === "tun" ? this.isTunEnable : kind === "tap" ? resolveTapMode(this.settings)
+                        : kind === "tapMulticast" ? this.settings.tapAllowMulticast === true : this.isMixinEnable;
+                    if (previous === enabled) return true;
+                    const commit = value => kind === "tun"
+                        ? this.chagneIsTunEnable({ isTun: value }) : kind === "tap"
+                            ? this.settings.legacyTapMode = value : kind === "tapMulticast"
+                                ? this.settings.tapAllowMulticast = value : this.changeIsMixinEnable({ isMixin: value });
+                    commit(enabled);
+                    // Vue watchers own the reload. Wait for their flush before observing it.
+                    await this.$nextTick();
+                    const result = await waitForProfileRefresh(this.clashApi);
+                    if (result?.success) return true;
+                    if (result?.actualState) {
+                        await this.restoreAppliedProfileState(result.actualState);
+                        throw new Error(result.message || getLanguage().failedConnectCore());
+                    }
+                    commit(previous);
+                    await this.$nextTick();
+                    const rollback = await waitForProfileRefresh(this.clashApi);
+                    if (!rollback?.success && rollback?.actualState) await this.restoreAppliedProfileState(rollback.actualState);
+                    throw new Error(result?.message || getLanguage().failedConnectCore());
+                }, enabled, requestId);
+            },
+            async restoreAppliedProfileState(state) {
+                this.restoringAppliedProfileState = true;
+                try {
+                    if (state.tun !== this.isTunEnable) this.chagneIsTunEnable({ isTun: !!state.tun });
+                    if (state.mixin !== this.isMixinEnable) this.changeIsMixinEnable({ isMixin: !!state.mixin });
+                    if (state.tapMode && state.tapMode !== resolveTapMode(this.settings)) this.settings.legacyTapMode = state.tapMode;
+                    if (typeof state.tapAllowMulticast === "boolean" && state.tapAllowMulticast !== this.settings.tapAllowMulticast) this.settings.tapAllowMulticast = state.tapAllowMulticast;
+                    await this.$nextTick();
+                } finally { this.restoringAppliedProfileState = false; }
+            },
+            requestRoutingMode(mode, requestId = null) {
+                return this.runProxyOperation("mode", async () => {
+                    if (await this.switchMode(mode) === false) throw new Error(getLanguage().failedConnectCore());
+                    return true;
+                }, mode, requestId);
+            },
+            ...Vuex.mapMutations({
+                setIsDevMode: "SET_IS_DEV_MODE",
+                setConfData: "SET_CONF_DATA",
+                changeProfile: "CHANGE_PROFILE",
+                changeProfileIndex: "CHANGE_PROFILES_INDEX",
+                setClashPath: "SET_CLASH_PATH",
+                setClashStatus: "SET_CLASH_STATUS",
+                loadProfiles: "LOAD_PROFILES",
+                setProfilesPath: "SET_PROFILES_PATH",
+                setLogFilePath: "SET_LOG_FILE_PATH",
+                changeIsMixinEnable: "CHANGE_IS_MIXIN_ENABLE",
+                chagneIsTunEnable: "CHANGE_IS_TUN_ENABLE",
+                setExePath: "SET_EXE_PATH",
+                appendError: "APPEND_ERROR",
+                addClashAxiosFlyingRequestCount: "ADD_AXIOS_FLYING_REQUEST_COUNT",
+                setShouldUseDarkTheme: "SET_SHOULD_USE_DARK_THEME",
+                setDetectedInterfaceName: "SET_DETECTED_INTERFACE_NAME",
+                setIsWindowShow: "SET_IS_WINDOW_SHOW",
+                setIsAppSuspend: "SET_IS_APP_SUSPEND",
+                setIsLocalMode: "SET_IS_LOCAL_MODE",
+                setIsLaunching: "SET_IS_LAUNCHING",
+                setMenuItems: "SET_MENU_ITEMS",
+                setIsSystemProxyOn: "SET_IS_SYSTEM_PROXY_ON",
+                setCurrentRoutePath: "SET_CURRENT_ROUTE_PATH",
+                addProfileRefreshTimes: "ADD_PROFILE_REFRESH_TIMES",
+                setCurrentProfilePayload: "SET_CURRENT_PROFILE_PAYLOAD",
+                setIsSilentUpgraded: "SET_IS_SILENT_UPGRADED",
+                setIsFirewallRuleExist: "SET_IS_FIREWALL_RULE_EXIST",
+                setUserDNS: "SET_USER_DNS",
+                setMatchedSSID: "SET_MATCHED_SSID"
+            }),
+            ...Vuex.mapActions(["setMode"]),
+            async setSSIDOptions() {
+                if (this.serviceOperation || this.proxyOperation) return;
+                const restoreDefaults = async () => {
+                    const mixin = cache.get(keys.IS_MIXIN) || false;
+                    const tun = cache.get(keys.IS_TUN) || false;
+                    const systemProxy = cache.get(keys.SYSTEM_PROXY) || false;
+                    this.changeIsMixinEnable({ isMixin: mixin });
+                    this.chagneIsTunEnable({ isTun: tun });
+                    if (await this.$setSystemProxy(systemProxy, this.confData)) this.setIsSystemProxyOn({ isOn: systemProxy });
+                };
+                try {
+                    this.setMatchedSSID({ ssid: "" });
+                    const connections = await getWlanInterfaces() || [];
+                    const strategy = yaml.parse(this.settings.ssidStrategyText).strategy;
+                    logger.info(JSON.stringify({ conns: connections, ssidStrategy: strategy }, null, 2));
+                    const connection = connections.find(item => item.SSID in strategy);
+                    if (!connection) {
+                        await restoreDefaults();
+                        return;
+                    }
+                    this.setMatchedSSID({ ssid: connection.SSID });
+                    const options = strategy[connection.SSID];
+                    if (!options) return;
+                    if (typeof options.mixin === "boolean") this.changeIsMixinEnable({ isMixin: options.mixin });
+                    if (typeof options.tun === "boolean") this.chagneIsTunEnable({ isTun: options.tun });
+                    if (typeof options.system === "boolean" && await this.$setSystemProxy(options.system, this.confData)) {
+                        this.setIsSystemProxyOn({ isOn: options.system });
+                    }
+                } catch (error) {
+                    logger.error(`failed to set ssid options: ${error}`);
+                }
+            },
+            async resetDNS() {
+                if (!this.isUserDNSChanged || !isMacOS()) return;
+                try {
+                    const { isUsingResetDNSServers = false, resetDNSServers = [] } = this.settings;
+                    if (isUsingResetDNSServers) await setDns(resetDNSServers);
+                    else if (this.userDNS !== null) await setDns(this.userDNS);
+                } catch (error) {
+                    logger.info(`failed to reset dns with error: ${error}`);
+                }
+            },
+            async breakConnections(proxyName) {
+                const mode = this.settings.connProxy ?? 0;
+                if (mode === 1) {
+                    const response = await this.clashApi.getConnections();
+                    if (response.status !== 200) return;
+                    for (const connection of response.data.connections || []) {
+                        if (connection.chains.includes(proxyName)) await this.clashApi.closeConnection(connection.id);
+                    }
+                } else if (mode === 2) {
+                    await this.clashApi.closeConnections();
+                }
+            },
+            persistSelectedProxy() {
+                return persistSelection({
+                    getProfiles: () => this.pfs,
+                    clashApi: this.clashApi,
+                    changeProfile: payload => this.changeProfile(payload)
+                });
+            },
+            runTrayScript() { this.settings.trayScriptManualRunTime = Date.now(); },
+            resetSystemProxySettings: lodash.debounce(async function resetSystemProxy() {
+                if (this.serviceOperation) return;
+                if (this.isSystemProxyOn) await this.$setSystemProxy(true, this.confData);
+            }, 500),
+            updateTrayIcon() {
+                if (!isWindows()) return;
+                const active = [proxyStatus.SYSTEM_PROXY, proxyStatus.IS_TUN, proxyStatus.IS_MIXIN].includes(this.status);
+                const icon = this.$getTrayIcon(active, this.mode);
+                console.log("updateTrayIcon", icon);
+                electron.ipcRenderer.send("status-changed", icon);
+            },
+            async resolveMixedPortConflict() {
+                if (this.isResolvingMixedPortConflict) return;
+                this.isResolvingMixedPortConflict = true;
+                const labels = getLanguage();
+                try {
+                    await electron.ipcRenderer.invoke("window-control", "show");
+                    while (this.clashMixedPort === 0) {
+                        const choice = await showMessageBox({
+                            type: "warning",
+                            title: labels.changeMixedPort(),
+                            message: labels.mixedPortUnavailable(),
+                            detail: labels.mixedPortRecoveryDescribe(),
+                            buttons: [labels.newPort(), labels.randomMixedPort(), labels.cancel()],
+                            defaultId: 1,
+                            cancelId: 2
+                        });
+                        if (!choice || choice.response === 2) return;
+
+                        let port = null;
+                        const manual = choice.response === 0;
+                        if (manual) {
+                            const result = await this.$input({
+                                title: labels.changeMixedPort(),
+                                data: [{
+                                    name: labels.newPort(), key: "port", placeholder: this.mixedPort || 7890, value: "",
+                                    validate: value => parsePort(value) !== null ? "" : labels.invalidPort()
+                                }],
+                                hint: labels.mixedPortRecoveryDescribe()
+                            }).catch(() => null);
+                            if (!result) return;
+                            port = parsePort(result.port);
+                            try {
+                                await setManualMixedPort({
+                                    clashApi: this.clashApi, port, checkAvailable: dependencies.checkMixedPort, sleep,
+                                    persist: value => updateYaml(path.join(this.clashPath, "config.yaml"), "mixed-port", value)
+                                });
+                            } catch (error) {
+                                await showMessageBox({
+                                    type: "error",
+                                    title: labels.changeMixedPort(),
+                                    message: error.reason === "rollback" ? labels.mixedPortRollbackFailed()
+                                        : error.reason === "persist" ? labels.mixedPortSaveFailed() : labels.portUnavailable(),
+                                    buttons: [labels.ok()]
+                                });
+                                if (error.reason === "rollback") {
+                                    if (error.actualPort !== undefined) this.clashMixedPort = error.actualPort;
+                                    return;
+                                }
+                                continue;
+                            }
+                        } else {
+                            try {
+                                port = await recoverWithRandomPort({
+                                    getPort, checkPort: async value => await dependencies.checkMixedPort(value) !== false,
+                                    clashApi: this.clashApi, sleep
+                                });
+                            } catch (_error) {
+                                await showMessageBox({
+                                    type: "error",
+                                    title: labels.changeMixedPort(),
+                                    message: labels.noAvailablePort(),
+                                    buttons: [labels.ok()]
+                                });
+                                continue;
+                            }
+                        }
+
+                        if (!manual) await updateYaml(path.join(this.clashPath, "config.yaml"), "mixed-port", port);
+                        if (manual) this.settings.randomMixedPort = false;
+                        this.setConfData({ data: { ...this.confData, "mixed-port": port } });
+                        this.clashMixedPort = port;
+                        notify(labels.port(), `${port}`, { silent: true });
+                        return;
+                    }
+                } finally {
+                    this.isResolvingMixedPortConflict = false;
+                }
+            },
+            async checkMixedPortConflict() {
+                if (this.proxyBusy
+                    || this.clashStatus !== connectionStatus.CONNECTED || this.clashMixedPort !== 0) {
+                    return false;
+                }
+                const confirmed = await confirmMixedPortConflict({
+                    clashApi: this.clashApi,
+                    sleep
+                });
+                if (!confirmed || this.proxyBusy
+                    || this.clashStatus !== connectionStatus.CONNECTED || this.clashMixedPort !== 0) {
+                    return false;
+                }
+                await this.resolveMixedPortConflict();
+                return true;
+            },
+            setFont(value) {
+                document.body.style.fontFamily = value || '"Microsoft Yahei", "PingFang SC", "system-ui", 微软雅黑, "TwemojiMozilla"';
+            },
+            async refreshProfile({ initializing = false } = {}) {
+                if (this.serviceOperation) return { success: false, message: null };
+                // Initial settings/watchers share the startup owner's final apply.
+                if (this.isInitializing && !initializing) return startupState(this).result;
+                this.profileApplyRevision = (this.profileApplyRevision || 0) + 1;
+                this.profileApplyCount = (this.profileApplyCount || 0) + 1;
+                const labels = getLanguage();
+                try {
+                    return await refreshRendererProfile(this, {
+                        fs,
+                        path,
+                        yaml,
+                        platform: runtimeProcess.platform,
+                        childProcess: dependencies.childProcess,
+                        profileNetworkEffects: dependencies.profileNetworkEffects,
+                        compileMixin: dependencies.requireFromString,
+                        runMixin: dependencies.runMixin,
+                        readProfileSource: dependencies.profileFiles?.readProfile,
+                        getLanguage,
+                        hash,
+                        setDns,
+                        getPort,
+                        onDisconnectCleanupError: () => logger.warn("Could not close all existing connections after disabling the proxy"),
+                        onTiming: (stage, milliseconds) => logger.info?.(`Profile apply ${stage}: ${milliseconds}ms`),
+                        mixinHelpers: {
+                            axios: httpClient,
+                            yaml,
+                            notify: (title, body = "", silent = true) => notify(title, body, { silent })
+                        },
+                        messages: {
+                            tunInterface: labels.tunModeEnableButIssue(),
+                            tapInterface: labels.modeTAPEnableNoINthisYAML(),
+                            providers: labels.providers()
+                        }
+                    });
+                } finally { this.profileApplyCount -= 1; }
+            },
+            prepareStartupProfiles(action) {
+                const task = Promise.resolve().then(action);
+                if (this.isInitializing) {
+                    const state = startupState(this), pending = state.preparations;
+                    state.revision++;
+                    pending.add(task);
+                    task.then(() => pending.delete(task), () => pending.delete(task));
+                }
+                return task;
+            },
+            async applyStartupProfile() {
+                const state = startupState(this);
+                let result, revision;
+                do {
+                    while (state.preparations.size) await Promise.allSettled([...state.preparations]);
+                    revision = state.revision;
+                    result = await this.refreshProfile({ initializing: true });
+                } while (state.revision !== revision);
+                state.finish(result);
+                return result;
+            },
+            async finishStartup() {
+                this.isInitializing = false;
+                this.setIsLaunching({ isLaunching: false });
+                startupState(this).finish({ success: false, message: getLanguage().clashCoreFailedStartup() });
+                await this.checkMixedPortConflict();
+            },
+            async switchMode(mode) {
+                const result = await this.setMode({ mode });
+                await this.$nextTick?.();
+                // Hold the operation through optional connection cleanup and the
+                // saved profile mode, not just the controller's PATCH response.
+                await this.modeChangeTask;
+                return result;
+            },
+            showLogsFolder(openFolder = false) {
+                if (!this.clashPath || !/\.log$/.test(this.logFilePath)) return;
+                return dependencies.openCoreLog(openFolder);
+            },
+            open(url) { electron.shell.openExternal(url); },
+            createClashCoreRuntime() {
+                return createClashCoreRuntime();
+            },
+            async killClashCore() {
+                await this.createClashCoreRuntime().stop({
+                    processHandle: this.clash,
+                    lightweightMode: cache.get(keys.IS_LIGHTWEIGHT_MODE_CLOSE) || false,
+                    platform: runtimeProcess.platform
+                });
+                this.clash = null;
+            },
+            async handlerRestartClash({ initializing = false } = {}) {
+                const ownsStartup = initializing && this.isInitializing;
+                if (this.serviceOperation || this.isCoreRestarting || this.profileApplyCount || this.isResolvingMixedPortConflict
+                    || (this.proxyOperation && this.proxyOperation !== "core") || ((this.isLaunching || this.isInitializing) && !ownsStartup)) return false;
+                this.coreRunRevision = (this.coreRunRevision || 0) + 1;
+                this.isCoreRestarting = true;
+                this.setIsLaunching({ isLaunching: true });
+                try {
+                    await this.killClashCore().catch(() => {});
+                    this.setClashStatus({ status: connectionStatus.DISCONNECTED });
+                    this.shwoError = false;
+                    await this.spawnClash();
+                    if (!ownsStartup) {
+                        if (!await this.waitForCoreReady()) throw new Error("Core startup timed out");
+                        this.setClashStatus({ status: connectionStatus.CONNECTED });
+                    }
+                    return true;
+                } catch (_error) {
+                    this.setIsLaunching({ isLaunching: false });
+                    return false;
+                } finally {
+                    this.isCoreRestarting = false;
+                }
+            },
+            async spawnClash() {
+                const revision = this.coreRunRevision, port = this.controllerPort;
+                const result = await this.createClashCoreRuntime().start({
+                    clashPath: this.clashPath,
+                    binaryPath: this.clashBinaryPath,
+                    coreType: this.settings.proxyCore,
+                    logLevel: this.confData["log-level"],
+                    isLocalMode: this.isLocalMode,
+                    portableMode: this.portableMode,
+                    devMode: this.devMode,
+                    lightweightMode: cache.get(keys.IS_LIGHTWEIGHT_MODE_CLOSE) || false,
+                    clashApi: this.clashApi,
+                    startupErrorMessage: getLanguage().clashCoreFailedStartup(),
+                    onLogFile: logPath => this.setLogFilePath({ path: logPath }),
+                    onCoreReady: async () => {
+                        const status = await this.getClashStatus();
+                        if (revision === this.coreRunRevision && port === this.controllerPort) this.setClashStatus({ status });
+                    },
+                    onServiceFallback: async () => {
+                        this.setIsLocalMode({ isLocal: true });
+                        await this.spawnClash();
+                    }
+                });
+                if (result.processHandle) {
+                    this.clash = result.processHandle;
+                    cache.put(keys.LAST_CLASH_PID, result.processHandle.pid);
+                }
+            },
+            createTunRuntime() {
+                return createTunRuntime();
+            },
+            setupTapDevice(install = true) { return this.createTunRuntime().setupTapDevice(install); },
+            refreshTapAfterSetup(installed) { return refreshTapRuntime(this, installed); },
+            async spawnTun2socks({ isCurrent, signal, allowMulticast = this.settings.tapAllowMulticast === true } = {}) {
+                const previousProcess = this.tun2socks;
+                this.tun2socks = null;
+                this.tun2socks = await this.createTunRuntime().spawnTun2socks({ currentProcess: previousProcess, mixedPort: this.mixedPort, allowMulticast, isCurrent, signal });
+            },
+            killSpawned(processHandle) { return this.createTunRuntime().killSpawned(processHandle); },
+            async getClashStatus() {
+                const revision = this.coreRunRevision, port = this.controllerPort, applyRevision = this.profileApplyRevision;
+                const result = await this.createClashCoreRuntime().getStatus(this.clashApi);
+                if (revision !== this.coreRunRevision || port !== this.controllerPort || applyRevision !== this.profileApplyRevision) return connectionStatus.DISCONNECTED;
+                this.clashMixedPort = result.mixedPort;
+                return result.connected ? connectionStatus.CONNECTED : connectionStatus.DISCONNECTED;
+            },
+            async waitForCoreReady() {
+                const deadline = Date.now() + 30000;
+                while (Date.now() < deadline && !this._isDestroyed) {
+                    if (await this.getClashStatus() === connectionStatus.CONNECTED) return true;
+                    await sleep(100);
+                }
+                return false;
+            },
+            async checkForUpdate() {
+                if (this.isSilentUpgraded) {
+                    logger.info("silent upgrade done, stop checking");
+                    return;
+                }
+                const currentVersion = await electron.ipcRenderer.invoke("app", "getVersion");
+                logger.info(`check for app update, current: ${currentVersion}`);
+                const response = await dependencies.publicContent.getUpdate();
+                if (response.status !== 200) return false;
+                const version = response.data.tag_name;
+                if (compareVersions(version, currentVersion) <= 0) return true;
+
+                const asset = selectReleaseAsset(response.data, {
+                    platform: runtimeProcess.platform, arch: runtimeProcess.arch, portable: this.portableMode
+                });
+                const page = releasePage(version);
+                this.newVersionInfo = {
+                    version,
+                    displayVersion: response.data.display_version || version,
+                    log: String(response.data.body || ""),
+                    url: asset?.browser_download_url || releasesUrl,
+                    releasePage: page,
+                    isPortable: this.portableMode,
+                    reactions: response.data?.reactions || null,
+                    reactionClick: () => electron.shell.openExternal(page)
+                };
+                return true;
+            },
+            createConfigurationRuntime() {
+                return createRendererConfiguration(this, {
+                    fs,
+                    path,
+                    yaml,
+                    uuid: uuid.v4,
+                    platform: runtimeProcess.platform,
+                    arch: runtimeProcess.arch,
+                    shouldReplaceWintun,
+                    getPort
+                });
+            },
+            loadConfData() { return this.createConfigurationRuntime().load(); },
+            initConfigFolder() { return this.createConfigurationRuntime().initialize(); },
+            initProfilesFolder() { return this.createConfigurationRuntime().initializeProfiles(); },
+            async spawnUserDefindExes() {
+                if (this.confData) await dependencies.startUserProcesses();
+            },
+            async preDownloadAds() {
+                if (this.settings.disableLoadingAdsLink !== false) return;
+                const response = await dependencies.publicContent.getAds();
+                if (this.settings.disableLoadingAdsLink === false && response.status === 200 && response.data.feedback) {
+                    cache.put(keys.AD_IMAGES, response.data.feedback);
+                }
+            },
+            async profileUpdater() {
+                if (!this.profiles || this.isAppSuspend) return;
+                const modificationTimes = dependencies.profileFiles
+                    ? await dependencies.profileFiles.modificationTimes(this.profilesPath) : null;
+                let updating = profileUpdateJobs.get(this);
+                if (!updating) { updating = new Set(); profileUpdateJobs.set(this, updating); }
+                const seen = new Set();
+                const now = () => Date.now();
+                const profilesToUpdate = (this.profiles.files || []).filter(profile => {
+                    const { interval, url, time, cron: cronExpression = "" } = profile;
+                    if (!url || updating.has(url) || seen.has(url)) return false;
+                    seen.add(url);
+                    try {
+                        const currentTime = moment();
+                        if (cronExpression && matchesCron(cron, cronExpression, currentTime)) return true;
+                        if (interval > 0) {
+                            const modifiedAt = modificationTimes ? modificationTimes[time] : fs.statSync(path.join(this.profilesPath, time)).mtime;
+                            if (!modifiedAt) return false;
+                            const failedAt = this.profileUpdateFailed[url];
+                            if (failedAt !== undefined) {
+                                if (!moment(failedAt).add(interval, "hours").isBefore(currentTime)) return false;
+                                delete this.profileUpdateFailed[url];
+                            }
+                            return moment(modifiedAt).add(interval, "hours").isBefore(currentTime);
+                        }
+                    } catch (_error) {}
+                    return false;
+                });
+                for (const profile of profilesToUpdate) updating.add(profile.url);
+                let results;
+                try {
+                    results = await Promise.allSettled(profilesToUpdate.map(async profile => downloadProfile({ url: profile.url, headersString: profile.headers })));
+                } finally { for (const profile of profilesToUpdate) updating.delete(profile.url); }
+                for (let index = 0; index < results.length; index++) {
+                    if (results[index].status !== "fulfilled") continue;
+                    const { success, message, targetIndex } = results[index].value;
+                    const url = profilesToUpdate[index].url;
+                    if (success && targetIndex === this.profiles.index) await this.refreshProfile();
+                    if (success && this.profileUpdateFailedURLs.includes(url)) {
+                        this.profileUpdateFailedURLs = this.profileUpdateFailedURLs.filter(item => item !== url);
+                    }
+                    if (message) {
+                        logger.warn(`${getLanguage().failUpdateUrlProfile()}${url}`);
+                        notify(getLanguage().profileUpdateFail(), url);
+                        if (!Object.prototype.hasOwnProperty.call(this.profileUpdateFailed, url)) this.profileUpdateFailed[url] = now();
+                        if (!this.profileUpdateFailedURLs.includes(url)) this.profileUpdateFailedURLs = [...this.profileUpdateFailedURLs, url];
+                    }
+                }
+                const activeFiles = (this.profiles.files || []).map(profile => profile.time);
+                if (dependencies.profileFiles) {
+                    await dependencies.profileFiles.cleanupOrphans(this.profilesPath);
+                    return;
+                }
+                fs.readdir(this.profilesPath, (error, files) => {
+                    if (error || files.length === 0) return;
+                    files.forEach(file => {
+                        if (!/^\d+\.yml$/.test(file) || activeFiles.includes(file)) return;
+                        const modifiedAt = fs.statSync(path.join(this.profilesPath, file)).mtimeMs;
+                        if (modifiedAt && moment(modifiedAt).isBefore(moment().subtract(1, "month"))) fs.unlinkSync(path.join(this.profilesPath, file));
+                    });
+                });
+            },
+            async rebindShortcut(shortcut, previousShortcut, callback, action) {
+                let retained = previousShortcut;
+                try {
+                    const result = await electron.ipcRenderer.invoke("globalShortcut", "bind", action, shortcut || "");
+                    if (result.success) {
+                        if (shortcut) this.shortcuts[action] = (...args) => { if (!this.serviceOperation) return callback(...args); };
+                        else delete this.shortcuts[action];
+                        return true;
+                    }
+                    retained = result.shortcut;
+                } catch (_error) {}
+                if (previousShortcut !== undefined && this.settings[action] === shortcut) this.settings[action] = retained;
+                await showMessageBox({ type: "warning", message: getLanguage().shortcutUnavailable() });
+                return false;
+            },
+            rebindScriptModeShortcut(shortcut, previousShortcut) {
+                return this.rebindShortcut(
+                    supportsScriptMode(this.settings.proxyCore) ? shortcut : "",
+                    previousShortcut,
+                    () => this.requestRoutingMode("script"), "shortcutScriptMode"
+                );
+            },
+            async detectInterfaceName() {
+                const interfaceName = await detectInterface();
+                if (interfaceName && interfaceName !== this.detectedInterfaceName) this.setDetectedInterfaceName({ interfaceName });
+            },
+            async quit() {
+                logger.info(getLanguage().appExiting());
+                await this.killClashCore();
+                await this.resetDNS();
+                try {
+                    if (this.isSystemProxyOn) await this.$setSystemProxy(false);
+                } finally {
+                    electron.ipcRenderer.send("cleanup-done");
+                }
+            }
+        },
+        mounted() {
+            window.addEventListener("online", async () => {
+                logger.info("network online");
+                await this.detectInterfaceName();
+                this.refreshProfile();
+            });
+            electron.ipcRenderer.on("wlan-status-changed", lodash.debounce((_event, payload) => {
+                if ([
+                    "ssidDidChangeForWiFiInterfaceWithName",
+                    "wlan_notification_acm_connection_complete",
+                    "network_interfaces_changed"
+                ].includes(payload?.code)) {
+                    logger.info(`wlan-status-changed: ${JSON.stringify(payload)}`);
+                    this.setSSIDOptions();
+                }
+            }, 200));
+            electron.ipcRenderer.on("wlan-status-listen-error", (_event, error) => {
+                logger.error(`failed to listen network change nativly: ${error}`);
+                window.addEventListener("online", () => this.setSSIDOptions());
+            });
+            electron.ipcRenderer.invoke("wlan-status-wanted");
+        },
+        async beforeMount() {
+            try {
+            await electron.ipcRenderer.invoke("globalShortcut", "capture", false);
+            const visible = await electron.ipcRenderer.invoke("window", "isVisible");
+            this.setIsWindowShow({ isShow: visible });
+            this.startTime = Date.now();
+            const packaged = await electron.ipcRenderer.invoke("app", "isPackaged");
+            this.setIsDevMode({ isDevMode: !packaged });
+            logger.info(`${getLanguage().appStartWithMode()}${this.devMode ? "dev" : "production"}`);
+            this.$router.replace({ path: this.currentRoutePath }).catch(() => {});
+
+            const executablePath = this.devMode ? "" : await electron.ipcRenderer.invoke("app", "getPath", "exe");
+            this.setExePath({ path: executablePath });
+
+            this.setShouldUseDarkTheme({
+                shouldUseDarkTheme: await electron.ipcRenderer.invoke("nativeTheme", "shouldUseDarkColors")
+            });
+            electron.ipcRenderer.on("native-theme-updated", (_event, shouldUseDarkTheme) => {
+                this.setShouldUseDarkTheme({ shouldUseDarkTheme });
+            });
+            electron.ipcRenderer.on("shortcut-pressed", async (_event, shortcut) => {
+                const handler = this.shortcuts[shortcut];
+                if (handler) await handler();
+            });
+            electron.ipcRenderer.send("clash-core-status-change", 0);
+            electron.ipcRenderer.on("break-connections", (_event, proxyName) => this.breakConnections(proxyName));
+            electron.ipcRenderer.on("persist-selected-proxy", () => this.persistSelectedProxy());
+            electron.ipcRenderer.on("app-exit", this.quit);
+            electron.ipcRenderer.on("power-event", (_event, name) => this.setIsAppSuspend({ isSuspend: name === "suspend" }));
+            electron.ipcRenderer.on("system-proxy-changed", async (_event, enabled, requestId) => {
+                await this.requestSystemProxy(enabled, requestId);
+            });
+            electron.ipcRenderer.send("mixin-changed", this.isMixinEnable);
+            electron.ipcRenderer.on("mixin-changed", (_event, enabled, requestId) => {
+                this.requestProfileToggle("mixin", enabled, requestId);
+            });
+            electron.ipcRenderer.send("tun-changed", this.isTunEnable);
+            electron.ipcRenderer.on("tun-changed", (_event, enabled, requestId) => {
+                this.requestProfileToggle("tun", enabled, requestId);
+            });
+            electron.ipcRenderer.on("run-tray-script", this.runTrayScript);
+            electron.ipcRenderer.on("mode-changed", (_event, mode, requestId) => this.requestRoutingMode(mode, requestId));
+            electron.ipcRenderer.on("app-open", async (_event, argumentsList) => {
+                const installArgument = argumentsList.find(argument => /clash:\/\/install-config\/?\?url=(.+?)(?=$|&)/.test(argument));
+                if (installArgument) {
+                    const url = decodeURIComponent(RegExp.$1.trim());
+                    if (/^https?:\/\//.test(url)) {
+                        const result = await downloadProfile({ url });
+                        notify("Profile", result.success ? getLanguage().profileDownloaded() : result.message);
+                        if (result.success) {
+                            this.changeProfileIndex({ index: result.targetIndex });
+                            this.refreshProfile();
+                        }
+                    }
+                }
+                if (argumentsList.some(argument => /clash:\/\/quit/.test(argument))) await this.quit();
+            });
+            electron.ipcRenderer.on("menu-item-change", (_event, item) => {
+                if (this.serviceOperation) return;
+                this.$router.replace({ path: `/home/${item}` });
+            });
+            electron.ipcRenderer.on("window-event", (_event, name) => {
+                if (["show", "hide"].includes(name)) this.setIsWindowShow({ isShow: name === "show" });
+                else if (name === "close" && this.settings.lightweightMode && !this.isLocalMode) {
+                    cache.put(keys.IS_LIGHTWEIGHT_MODE_CLOSE, true);
+                    electron.ipcRenderer.send("cleanup-done");
+                }
+            });
+
+            const homePath = await electron.ipcRenderer.invoke("app", "getPath", "home");
+            const portableDataPath = path.join(executablePath, "../data");
+            let clashPath = path.join(homePath, "/.config/clash");
+            const runtimeInfo = await electron.ipcRenderer.invoke("app", "getRuntimeInfo");
+            if (runtimeInfo.portableDataExists) {
+                clashPath = portableDataPath;
+                this.portableMode = true;
+            }
+            this.userPath = homePath;
+            this.setClashPath({ path: clashPath });
+            await this.initConfigFolder();
+            await this.loadConfData();
+            if (isMacOS()) {
+                getDns().then(dns => this.setUserDNS({ dns })).catch(error => logger.info(`faile to get user dns setting with error: ${error}`));
+            }
+            this.loadSettings();
+            electron.ipcRenderer.send("core-type-changed", this.settings.proxyCore);
+            if (isWindows()) {
+                try {
+                    const pac = await startPacServer(this.clashPath);
+                    showPacFeedback(this, pac).catch(() => {});
+                    logger.info(`${getLanguage().httpStartAt()}${this.innerServerPort}`);
+                } catch (error) {
+                    logger.info(`${getLanguage().httpFailStart()}${error}`);
+                    showPacFeedback(this, undefined, error).catch(() => {});
+                }
+            }
+
+            const lightweightMode = cache.get(keys.IS_LIGHTWEIGHT_MODE_CLOSE) || false;
+            const { hideTrayIcon, hideAfterStartup, profilePath } = this.settings;
+            if (hideTrayIcon || lightweightMode || !hideAfterStartup) electron.ipcRenderer.invoke("window-control", "show");
+            this.setProfilesPath({ path: profilePath || path.join(this.clashPath, "profiles") });
+            this.initProfilesFolder();
+            this.loadProfiles();
+            if (!this.devMode && !lightweightMode) {
+                try { await this.createConfigurationRuntime().randomizePorts(lightweightMode); } catch (_error) {}
+            }
+            const status = await serviceStatus();
+            this.setIsLocalMode({ isLocal: status !== serviceActiveStatus });
+
+            const pollCoreStatus = createCoreStatusPoller(this, connectionStatus);
+            pollCoreStatus();
+            Array.from({ length: 5 }).forEach((_unused, index) => setTimeout(pollCoreStatus, 500 + 500 * index));
+            setInterval(pollCoreStatus, 3000);
+            await this.$nextTick(); // Publish the final controller before its core starts.
+            await this.handlerRestartClash({ initializing: true });
+            if (!await this.waitForCoreReady()) {
+                this.appendError({ error: getLanguage().clashCoreFailedStartup() });
+                return;
+            }
+            this.setClashStatus({ status: connectionStatus.CONNECTED });
+
+            cache.put(keys.IS_LIGHTWEIGHT_MODE_CLOSE, false);
+            if (!this.showStartup) {
+                this.showStartup = true;
+                if (isWindows() && runtimeInfo.release.startsWith("6.")) {
+                    notify("Attention", "The support for Windows 7 will be dropped soon in 2023 due to upstream changes. Click to learn more.", { hideWindowOnClick: true }, () => {
+                        electron.shell.openExternal("https://cloud.google.com/blog/products/chrome-enterprise/extending-chrome-on-windows-7-to-support-enterprise-customers");
+                    });
+                } else {
+                    notify(getLanguage().cfwRunInBg(), getLanguage().enjoyFreedom());
+                }
+            }
+            await this.detectInterfaceName();
+            await this.setSSIDOptions();
+            await this.applyStartupProfile();
+            await this.finishStartup();
+            this.spawnUserDefindExes();
+            if (this.settings.checkForUpdates) this.checkForUpdate().catch(console.error);
+            setInterval(() => { if (this.settings.checkForUpdates) this.checkForUpdate().catch(console.error); }, 21600000);
+            this.preDownloadAds().catch(console.error);
+            setInterval(this.profileUpdater, 60000);
+            this.profileUpdater();
+            if (isWindows()) this.setIsFirewallRuleExist({ isExist: await firewallRuleExists() });
+
+            mousetrap.bind(["command+f12", "ctrl+f12"], () => {
+                electron.ipcRenderer.invoke("webContent", "toggleDevTools");
+                return false;
+            });
+            mousetrap.bind(["command+w", "ctrl+w"], event => {
+                if (shouldCloseWindowForShortcut(event)) {
+                    electron.ipcRenderer.invoke("window", "close");
+                    return false;
+                }
+                return undefined;
+            });
+            mousetrap.bind("esc", event => {
+                if (shouldCloseWindowForShortcut(event)) {
+                    electron.ipcRenderer.invoke("window", "close");
+                    return false;
+                }
+                return undefined;
+            }, "keydown");
+            bindMenuShortcuts({
+                mousetrap, getMenuItems: () => this.serviceOperation ? [] : this.menuItemsWithOrder,
+                onNavigate: () => { this.menuKeyboardClickTimes++; },
+                navigate: path => this.$router.replace({ path }).catch(() => {})
+            });
+            } finally { if (this.isInitializing) await this.finishStartup(); }
+        }
+    };
+}
+
+module.exports = { createMacDnsHelpers, createHomePageOptions };
